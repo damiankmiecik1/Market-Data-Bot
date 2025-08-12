@@ -1,0 +1,11 @@
+ccxt
+pandas
+numpy
+ta
+yfinance
+requests
+APScheduler
+pytz
+pytrends
+python-dotenv
+filelock
