@@ -40,7 +40,7 @@ if not TG_CHAT:
     TG_CHAT = [CONFIG["telegram"]["chat_id"]]
 ETHERSCAN_KEY: str = os.getenv("ETHERSCAN_KEY", "")
 
-# Global HTTP session with retry/backoff (soft errors)
+# Global HTTP session z retry/backoff (soft errors)
 _S = requests.Session()
 _retry = Retry(
     total=3,
@@ -55,7 +55,7 @@ _S.headers.update({"User-Agent": "hot-exit-bot/8.7 (+github.com/your/repo)"})
 
 def http_json(url: str, method: str = "GET", params: Optional[Dict[str, Any]] = None,
               data: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Optional[Dict[str, Any]]:
-    # Does not raise exceptions on 4xx/5xx — returns json/text with status code
+    # Nie rzuca wyjątków na 4xx/5xx — zwraca json/tekst z kodem statusu
     try:
         r = _S.request(method, url, params=params, data=data, timeout=timeout)
     except requests.RequestException as e:
@@ -75,8 +75,7 @@ def http_json(url: str, method: str = "GET", params: Optional[Dict[str, Any]] = 
 def now_local() -> dt.datetime:
     return dt.datetime.now(TZ)
 
-
-def tg_send(text, disable_preview=True):
+def tg_send(text, disable_preview=True, parse_mode=None):
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         max_len = 3800
@@ -90,9 +89,17 @@ def tg_send(text, disable_preview=True):
                     parts.append("".join(buf)); buf=[]; size=0
                 buf.append(line); size += len(line)
             if buf: parts.append("".join(buf))
+        
         for chunk in parts:
             for chat in TG_CHAT:
-                data = {"chat_id": chat, "text": chunk, "disable_web_page_preview": disable_preview}
+                data = {
+                    "chat_id": chat, 
+                    "text": chunk, 
+                    "disable_web_page_preview": disable_preview
+                }
+                if parse_mode:
+                    data["parse_mode"] = parse_mode
+                
                 r = _S.post(url, data=data, timeout=15)
                 try:
                     j = r.json()
@@ -126,11 +133,11 @@ def save_state(state: Dict[str, Any]) -> None:
         os.replace(tmp, STATE_FILE)
 
 
-# CCXT cache + markets + OHLCV cache
+# CCXT cache + rynków + OHLCV cache
 CCXT_CACHE: Dict[str, Any] = {}
 MARKETS_LOADED: set = set()
 OHLCV_CACHE: Dict[Any, Any] = {}
-OHLCV_TTL_SEC = 15*60  # with intraday might be 1800-3600 for less usage
+OHLCV_TTL_SEC = 15*60  # przy intraday można dać 1800–3600 dla mniejszego zużycia
 
 
 def get_ccxt(exchange: str):
@@ -348,10 +355,10 @@ def euphoria_signals(state: Dict[str, Any], btc_d: Optional[float], eth_btc: Opt
 
 def phase4_signals(state: Dict[str, Any], btc_d: Optional[float], dxy: Optional[float], dxy_slope: Optional[float]) -> Tuple[int, List[str]]:
     """
-    Phase 4: base signals:
-    - BTC.D upwards reversal when compared with previous minimum (+3 pp)
-    - DXY high and growing
-    VIX besides the function (as an additional signal).
+    Faza 4 bez PMI: sygnały bazowe:
+    - BTC.D odwrót w górę względem ostatniego minimum (np. +3 p.p.)
+    - DXY wysoko i rośnie
+    VIX dokładamy poza funkcją (jako dodatkowy sygnał).
     """
     hits = 0; details: List[str] = []
     p4 = CONFIG.get("thresholds", {}).get("phase4", {})
@@ -410,7 +417,7 @@ def volume_label(ratio: float) -> str:
     return "bardzo słaby"
 
 
-# Additional indicators
+# Dodatkowe wskaźniki
 def get_fear_greed() -> Tuple[Optional[int], Optional[str]]:
     try:
         j = http_json("https://api.alternative.me/fng/?limit=2", timeout=10)
@@ -506,6 +513,7 @@ def daily_report() -> None:
             state["last_memecoin_count"] = meme_count
         except: pass
 
+    # Dodatkowe wskaźniki
     fng_val=fng_cls=None; vix=None; vix_slope=None
     btc_f_last=btc_f_avg=eth_f_last=eth_f_avg=None
     stables_cap=None
@@ -538,7 +546,7 @@ def daily_report() -> None:
         state["stable_hist"].append({"date": today, "val": float(stables_cap)})
         state["stable_hist"] = state["stable_hist"][-365:]
 
-    # Google Trends (5y) — update every N days
+    # Google Trends (5y) — aktualizuj co N dni
     trends_days = int(CONFIG.get("report", {}).get("trends_update_days", 1))
     last_td = state["trends"].get("last_date")
     need_update = (last_td is None) or ((dt.datetime.fromisoformat(last_td).date() + dt.timedelta(days=trends_days)) <= now_local().date())
@@ -556,7 +564,7 @@ def daily_report() -> None:
             trends_info = {"tf": state["trends"].get("tf","today 5-y"), "holo_last": lastv, "holo_peak": peak,
                            "holo_rel": rel, "holo_high": rel >= threshold, "threshold": threshold}
 
-    # Euphoria (basic 5) + others (F&G, Funding)
+    # Euforia (bazowe 5) + dodatki (F&G, Funding)
     eup_hits, eup_details = euphoria_signals(state, btc_d, eth_btc, gas, meme_count, trends_info)
     eup_total = 5 + (1 if CONFIG["features"].get("fear_greed", True) else 0) + (1 if CONFIG["features"].get("funding", True) else 0)
     add_details: List[str] = []
@@ -570,7 +578,7 @@ def daily_report() -> None:
         if last_hi or avg_hi: eup_hits += 1; add_details.append("Funding gorący (BTC/ETH)")
     if add_details: eup_details += add_details
 
-    # Phase 4 (basic 2: BTC.D reversal, DXY↑) + VIX
+    # Faza 4 (bazowe 2: BTC.D odwrót, DXY↑) + VIX
     p4_hits, p4_details = phase4_signals(state, btc_d, dxy, dxy_slope)
     p4_total = 2 + (1 if CONFIG["features"].get("vix", True) else 0)
     if CONFIG["features"].get("vix", True) and (vix is not None):
@@ -580,117 +588,99 @@ def daily_report() -> None:
     # Pi Cycle
     pct = pi_cycle_top_signal()
 
-    # Verdict
+    # Werdykt
     p2_ok = (rsi_cond + dev_cond + vol_cond) >= 2
     p3b_ok = weak_cond
     p3a_ok = (eup_hits >= 3)
     p4_ok = (p4_hits >= 2)
     p1_ok = not (p2_ok or p3a_ok or p3b_ok or p4_ok)
 
-    # Filing the report
-    def yn(b: bool) -> str: return "Tak ✅" if b else "Nie —"
+    # SKŁADANIE RAPORTU
+    def yn(b: bool) -> str: return "*Tak ✅*" if b else "Nie —"
     line_mkt: List[str] = []
-    if p2info.get("hot_eth") is not None: line_mkt.append(f"HOT/ETH {p2info['hot_eth']:.8f}")
-    if eth_btc is not None: line_mkt.append(f"ETH/BTC {eth_btc:.5f}")
-    if total3_usd is not None: line_mkt.append(f"TOTAL3 ${total3_usd/1e9:,.1f}B".replace(",", " "))
-    if btc_d is not None: line_mkt.append(f"BTC.D {btc_d:.1f}%")
+    if p2info.get("hot_eth") is not None: line_mkt.append(f"`HOT/ETH`: `{p2info['hot_eth']:.8f}`")
+    if eth_btc is not None: line_mkt.append(f"`ETH/BTC`: `{eth_btc:.5f}`")
+    if total3_usd is not None: line_mkt.append(f"`TOTAL3`: `${total3_usd/1e9:,.1f}B`".replace(",", " "))
+    if btc_d is not None: line_mkt.append(f"`BTC.D`: `{btc_d:.1f}%`")
 
-    # HOT vs ETH
     rsi_v = p2info['rsi']; dev = p2info['dev_pct']; vol7 = p2info['vol7']; vol30 = p2info['vol30']
     ratio = (vol7/vol30) if vol30>0 else 0
-    hot_class = "RSI wysokie" if (rsi_v is not None and rsi_v>=80) else ("RSI umiarkowane" if (rsi_v is not None and rsi_v>=60) else "RSI niskie")
-    dev_class = "cena wyraźnie nad średnią" if dev>=30 else ("cena nad średnią" if dev>=0 else "cena poniżej średniej")
-    vol_class = "wolumen eksploduje" if ratio>=3 else ("wolumen ≈ norma" if ratio>=1 else "wolumen niższy niż norma")
-    hot_line = f"{hot_class} (RSI {rsi_v:.1f}), {dev_class}, {vol_class}"
     vol_today = float(df['vol_hot'].iloc[-1]); vol_ratio = ratio; label = volume_label(vol_ratio)
-    hot_vol_line = (f"Wolumen HOT (USDT): dziś {vol_today:,.0f} | śr.7d {vol7:,.0f} | śr.30d {vol30:,.0f} | 7d/30d = {vol_ratio:.2f}× ({vol_ratio*100:.0f}%) — {label}").replace(",", " ")
+    hot_vol_line = (f"Wolumen HOT (USDT): dziś `{vol_today:,.0f}` | 7d/30d = `{vol_ratio:.2f}×` ({label})").replace(",", " ")
 
     ethbtc_zone = format_ethbtc_zone(eth_btc)
     t3_line = total3_trend_line(state)
-
-    # Trends 5y
+    
     trends_line = None
     if trends_info and trends_info.get("holo_rel") is not None:
-        rel = trends_info["holo_rel"]; thr = trends_info.get("threshold", 40)
-        lastv = trends_info.get("holo_last"); peakv = trends_info.get("holo_peak")
-        trends_line = f"Holochain 5y = {rel:.0f}/100 (last {lastv:.0f}, peak {peakv:.0f}, próg {thr})"
+        rel = trends_info["holo_rel"]
+        trends_line = f"Holochain 5y = `{rel:.0f}/100`"
 
-    # Pi Cycle
     pi_line = None
     if pct is not None:
         arrow = "↑" if pct["gap_delta"] > 0 else ("↓" if pct["gap_delta"] < 0 else "→")
-        pi_line = (f"Pi Cycle: 111DMA {pct['dma111']:,.0f} vs 2×350DMA {pct['dma350x2']:,.0f} | "
-                   f"różnica {pct['gap']:,.0f} ({pct['gap_pct']:.2f}%) {arrow} {pct['gap_delta']:,.0f} | "
-                   f"sygnał: {'CROSS ⚠️' if pct['cross'] else 'brak'}").replace(",", " ")
+        pi_line = (f"Różnica `{pct['gap']:,.0f}` ({pct['gap_pct']:.2f}%) {arrow} | Sygnał: *{'CROSS ⚠️' if pct['cross'] else 'brak'}*").replace(",", " ")
 
-    # HOT/ETH vs ATH
     hot_eth_ath = CONFIG.get("overrides", {}).get("hot_eth_ath")
     ath_line = None
     if hot_eth_ath and p2info.get("hot_eth") is not None:
         cur = p2info["hot_eth"]; ath = float(hot_eth_ath)
         diff_pct = (cur/ath - 1.0)*100.0 if ath>0 else 0.0
-        ath_line = f"HOT/ETH vs ATH 2021 ({ath:.8f}): {cur:.8f} ({diff_pct:.1f}%)"
+        ath_line = f"HOT/ETH vs ATH: `{diff_pct:.1f}%`"
 
     gas_line = format_gas_line(gas)
-
-    # Funding & F&G & Stable & VIX lines
-    def fmt_pct(x: Optional[float]) -> str: return "—" if x is None else f"{x:.3f}%"
-    fund_line = f"Funding (8h) BTC last/avg {fmt_pct(btc_f_last)}/{fmt_pct(btc_f_avg)} | ETH {fmt_pct(eth_f_last)}/{fmt_pct(eth_f_avg)}"
-    fng_line = None if fng_val is None else f"Fear & Greed: {fng_val} ({fng_cls or ''})"
+    def fmt_pct(x: Optional[float]) -> str: return "`—`" if x is None else f"`{x:.3f}%`"
+    fund_line = f"Funding BTC: {fmt_pct(btc_f_last)}/{fmt_pct(btc_f_avg)} | ETH: {fmt_pct(eth_f_last)}/{fmt_pct(eth_f_avg)}"
+    fng_line = None if fng_val is None else f"Fear & Greed: `{fng_val}` ({fng_cls or ''})"
     s_line, _ = stables_line_and_delta(state)
-    vix_line = None if vix is None else f"VIX: {vix:.1f} " + ("(rosnący)" if (vix_slope and vix_slope>0) else "(malejący/flat)")
+    vix_line = None if vix is None else f"VIX: `{vix:.1f}` " + ("(rosnący)" if (vix_slope and vix_slope>0) else "(malejący/flat)")
 
-    # Memecoins lines
     meme_line = None
     if meme_count is not None:
         meme_thr = CONFIG["thresholds"]["phase3"]["meme_top50_min"]
-        sample = f" (np. {', '.join(meme_names[:5])})" if meme_names else ""
-        meme_line = f"Memecoiny w TOP50 wolumenu: {meme_count}/50 (próg {meme_thr}){sample}"
+        sample = f" (np. {', '.join(meme_names[:3])})" if meme_names else ""
+        meme_line = f"Memecoiny w TOP50 vol: `{meme_count}/50` (próg {meme_thr}){sample}"
 
     # Sending the report
     msg: List[str] = []
-    msg.append("📊 Raport dzienny HOT (12:00) — strefa CEST/CET")
-    msg.append(f"Data: {today}")
+    msg.append(f"*📊 Raport dzienny HOT ({CONFIG['schedule']['daily_report_hour']}:00)*")
+    msg.append(f"Data: `{today}`")
     msg.append("")
-    msg.append("🚦 Werdykt:")
-    msg.append(f"• Faza 1 (trzymaj i obserwuj): {yn(p1_ok)}")
+    msg.append("*🚦 Werdykt:*")
+    msg.append(f"• Faza 1 (obserwuj): {yn(p1_ok)}")
     msg.append(f"• Faza 2 (paraboliczny HOT): {yn(p2_ok)}")
-    msg.append(f"• Faza 3‑A (euforia rynku): {yn(p3a_ok)} ({eup_hits}/{eup_total})")
-    msg.append(f"• Faza 3‑B (słabość HOT): {yn(p3b_ok)}")
-    msg.append(f"• Faza 4 (dystrybucja): {yn(p4_ok)} ({p4_hits}/{p4_total})")
+    msg.append(f"• Faza 3-A (euforia rynku): {yn(p3a_ok)} (`{eup_hits}/{eup_total}`)")
+    msg.append(f"• Faza 3-B (słabość HOT): {yn(p3b_ok)}")
+    msg.append(f"• Faza 4 (dystrybucja): {yn(p4_ok)} (`{p4_hits}/{p4_total}`)")
     msg.append("")
-    msg.append("Kluczowe sygnały:")
+    msg.append("*Kluczowe sygnały:*")
     if line_mkt: msg.append("• " + " | ".join(line_mkt))
     if t3_line: msg.append("• " + t3_line)
     if ethbtc_zone: msg.append("• " + ethbtc_zone)
     if meme_line: msg.append("• " + meme_line)
-    msg.append("• HOT vs ETH: " + hot_line)
-    if p2info.get("hot_eth_change_pct") is not None and p2info.get("rsi_delta") is not None:
-        msg.append(f"• zmiana d/d: HOT/ETH {p2info['hot_eth_change_pct']:.2f}% | RSI {p2info['rsi_delta']:.1f}")
-    if ath_line: msg.append("• " + ath_line)
-    msg.append("• " + hot_vol_line)
+    msg.append("")
+    msg.append("*Analiza HOT/ETH:*")
+    if p2info.get("rsi") is not None:
+        msg.append(f"• RSI: `{p2info['rsi']:.1f}` | Zmiana d/d: `{p2info['rsi_delta']:.1f}`")
+    if p2info.get("hot_eth_change_pct") is not None:
+        msg.append(f"• Zmiana ceny d/d: `{p2info['hot_eth_change_pct']:.2f}%`")
+    if ath_line: msg.append(f"• {ath_line}")
+    msg.append(f"• {hot_vol_line}")
+    msg.append("")
+    msg.append("*Sygnały makro:*")
     if trends_line: msg.append("• Google Trends: " + trends_line)
     if dxy is not None:
-        msg.append(f"• DXY: {dxy:.2f} " + ("(rosnący)" if (dxy_slope and dxy_slope>0) else "(malejący/flat)"))
+        msg.append(f"• DXY: `{dxy:.2f}` " + ("(rosnący)" if (dxy_slope and dxy_slope>0) else "(malejący/flat)"))
     if gas_line: msg.append("• " + gas_line)
     if fng_line: msg.append("• " + fng_line)
     if CONFIG["features"].get("funding", True): msg.append("• " + fund_line)
     if CONFIG["features"].get("stablecoins", True) and s_line: msg.append("• " + s_line)
     if vix_line: msg.append("• " + vix_line)
-    if pi_line: msg.append("• " + pi_line)
-    if eup_hits>0: msg.append("• Spełnione sygnały euforii: " + "; ".join(eup_details))
-
-    # Explanations
-    msg.append("")
-    msg.append("Legenda:")
-    msg.append("• Pi Cycle: porównanie średnich BTC — 111DMA vs 2×350DMA; gap = 111DMA − 2×350DMA.")
-    msg.append("  CROSS = gdy gap przechodzi z wartości ujemnych na dodatnie (ostrzeżenie szczytu).")
-    msg.append("  Wskazówka: im bliżej 0 i gdy gap rośnie (↑), tym bliżej sygnału; spadek (↓) = oddalamy się. % = odległość względem 2×350DMA.")
-    msg.append("• Gas (ETH): safe/propose/fast = sugerowane ceny gwei; base = opłata bazowa sieci (EIP‑1559). Długo wysokie ⇒ euforia/obciążona sieć.")
-    msg.append("• Funding: dodatnie i rosnące (zwłaszcza ≥0.05% last lub ≥0.03% avg) ⇒ ryzyko squeeze/topów lokalnych.")
-    msg.append("• Fear & Greed: ≥80 = ekstremalna chciwość (składnik euforii).")
-
-    tg_send("\n".join(msg))
+    if pi_line: msg.append("• Pi Cycle: " + pi_line)
+    if eup_hits>0: msg.append("• Sygnały euforii: " + "; ".join(eup_details))
+    
+    # Final send call with Markdown enabled
+    tg_send("\n".join(msg), parse_mode="Markdown")
 
     # CSV
     row = {
@@ -709,6 +699,7 @@ def daily_report() -> None:
         "gas_fast": gas["fast"] if (gas and isinstance(gas,dict) and gas.get("fast") is not None) else "",
         "gas_base": gas["base"] if (gas and isinstance(gas,dict) and gas.get("base") is not None) else "",
         "dxy": round(dxy,2) if dxy is not None else "",
+        # PMI usunięte – zostawiamy puste kolumny dla kompatybilności CSV:
         "pmi": "",
         "pmi_series": "",
         "fng": fng_val if fng_val is not None else "",
@@ -730,7 +721,7 @@ def daily_report() -> None:
     }
     log_daily_csv(today, row)
 
-    # Alerts
+    # Alerty
     state = load_state()
     if p2_ok and throttle(state, "phase2", hours=12):
         tg_send("⚠️ Faza 2: HOT wygląda na paraboliczny (≥2/3). Plan: sprzedać 20% w 3–5 krokach."); mark_alert(state, "phase2")
@@ -741,7 +732,7 @@ def daily_report() -> None:
     if p4_ok and throttle(state, "phase4", hours=24):
         tg_send("🔴 Faza 4: Sygn. odwrotu (≥2/3). Domknij ostatnie 20%."); mark_alert(state, "phase4")
 
-    # Additional alerts
+    # Dodatkowe alerty
     if (CONFIG["features"].get("fear_greed", True)
         and fng_val is not None
         and fng_val >= CONFIG.get("thresholds", {}).get("phase3", {}).get("fng_greed", 80)
@@ -780,7 +771,7 @@ if __name__ == "__main__":
     )
     sched.add_job(daily_report, CronTrigger(hour=CONFIG["schedule"]["daily_report_hour"], minute=0))
 
-    # If you want ONLY daily report, set intraday_minutes to 0 in config.json
+    # Jeśli chcesz TYLKO raport dzienny, ustaw intraday_minutes na 0 w config.json
     if CONFIG["schedule"].get("intraday_minutes", 0) and CONFIG["schedule"]["intraday_minutes"] > 0:
         sched.add_job(intraday_alerts, "interval", minutes=CONFIG["schedule"]["intraday_minutes"])
 
