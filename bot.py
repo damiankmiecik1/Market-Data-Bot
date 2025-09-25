@@ -39,6 +39,7 @@ TG_CHAT: str = CONFIG["telegram"].get("chat_ids")
 if not TG_CHAT:
     TG_CHAT = [CONFIG["telegram"]["chat_id"]]
 ETHERSCAN_KEY: str = os.getenv("ETHERSCAN_KEY", "")
+COINGLASS_API_KEY: str = os.getenv("COINGLASS_API_KEY", "")
 
 # Global HTTP session z retry/backoff (soft errors)
 _S = requests.Session()
@@ -296,6 +297,58 @@ def google_trends_scores(timeframe: Optional[str] = None) -> Optional[Dict[str, 
                 "holofuel_last": holoFuel_last, "threshold": threshold}
     except Exception: return None
 
+# NOWA FUNKCJA DO DODANIA W bot.py
+
+def get_coinglass_indicators() -> Optional[Dict[str, Dict[str, Any]]]:
+    """Pobiera kluczowe wskaźniki makro z API CoinGlass, używając klucza API."""
+    if not COINGLASS_API_KEY:
+        print("Brak klucza API dla CoinGlass w pliku .env. Pomijam pobieranie wskaźników.")
+        return None
+        
+    try:
+        # UWAGA: Sprawdź w dokumentacji CoinGlass, czy ten URL i nazwa nagłówka są poprawne!
+        url = "https://open-api.coinglass.com/public/v2/indicator/bull_market_indicator"
+        headers = {"coinglass-api-key": COINGLASS_API_KEY}
+        
+        j = http_json(url, headers=headers, timeout=20)
+
+        if not j or not j.get("success") or not isinstance(j.get("data"), list):
+            print("CoinGlass API error: Brak danych lub nieprawidłowy format.")
+            return None
+
+        # Słownik mapujący nazwy z API na nasze uproszczone klucze
+        INDICATOR_MAP = {
+            "MVRV Z-Score": "mvrv",
+            "Puell Multiple": "puell",
+            "Net Unrealized Profit/Loss(NUPL)": "nupl",
+            "Reserve Risk": "reserve_risk",
+            "Altcoin Season Index": "alt_season",
+            "Pi Cycle Top Indicator": "pi_cycle",
+            "Bitcoin Dominance": "btc_dominance"
+        }
+
+        processed_data = {}
+        for item in j["data"]:
+            api_name = item.get("indicatorName")
+            if api_name in INDICATOR_MAP:
+                key = INDICATOR_MAP[api_name]
+                try:
+                    # Próbujemy przekonwertować na liczbę, aby ułatwić formatowanie
+                    current_val = float(item.get("currentValue"))
+                except (ValueError, TypeError):
+                    current_val = item.get("currentValue") 
+
+                processed_data[key] = {
+                    "current": current_val,
+                    "reference": item.get("referenceValue", "N/A"),
+                    "hit": "✅" if item.get("hitOrNot") else "❌"
+                }
+        return processed_data
+            
+    except Exception as e:
+        print(f"Błąd podczas pobierania wskaźników z CoinGlass: {e}")
+        return None
+
 
 def phase2_signals(df: pd.DataFrame) -> Tuple[bool, bool, bool, Dict[str, Any]]:
     price = df["hot_eth"]; r = rsi(price)
@@ -485,68 +538,38 @@ def mark_alert(state: Dict[str, Any], key: str) -> None:
     state["alerts"][key] = dt.datetime.utcnow().isoformat(); save_state(state)
 
 
+# CAŁKOWICIE ZASTĄP STARĄ FUNKCJĘ daily_report PONIŻSZĄ WERSJĄ
+
 def daily_report() -> None:
+    # --- 1. POBIERANIE DANYCH ---
     state = load_state()
+    today = now_local().strftime("%Y-%m-%d")
+
+    # Dane kluczowe dla HOT
     df = synthetic_hot_eth(tf="1d", limit=200)
     if df is None or len(df)<60:
-        tg_send("⚠️ Brak danych HOT/ETH. Raport może być niepełny."); return
+        tg_send("⚠️ Brak danych HOT/ETH. Raport nie może zostać wygenerowany."); return
+    
+    # Dane makro z CoinGlass
+    cg_data = get_coinglass_indicators()
+    if not cg_data:
+        tg_send("⚠️ Brak danych z CoinGlass. Raport makro nie może zostać wygenerowany.")
+        # Można kontynuować z raportem HOT, ale sygnały mogą być niepełne
 
-    rsi_cond, dev_cond, vol_cond, p2info = phase2_signals(df)
-    weak_cond, weak_info = phase3_hot_weakness(df)
-
-    btc_d=eth_d=total_usd=total3_usd=None
-    eth_btc=None; gas=None; dxy=None; dxy_slope=None
-    meme_count=None; meme_names=None; trends_info=None
-
-    try: btc_d, eth_d, total_usd, total3_usd = get_global_caps()
-    except: pass
-    try: eth_btc = get_eth_btc()
-    except: pass
-    try: gas = get_gas_gwei()
-    except: pass
-    try: dxy, dxy_slope = get_dxy()
-    except: pass
-
-    if CONFIG["features"].get("memecoin_counter", True):
-        try:
-            meme_count, meme_names = count_memecoins_top50(CONFIG["watchlists"]["memecoins"], return_names=True)
-            state["last_memecoin_count"] = meme_count
-        except: pass
-
-    # Dodatkowe wskaźniki
-    fng_val=fng_cls=None; vix=None; vix_slope=None
-    btc_f_last=btc_f_avg=eth_f_last=eth_f_avg=None
-    stables_cap=None
-    try:
-        if CONFIG["features"].get("fear_greed", True): fng_val, fng_cls = get_fear_greed()
-    except: pass
-    try:
-        if CONFIG["features"].get("vix", True): vix, vix_slope = get_vix()
-    except: pass
-    try:
-        if CONFIG["features"].get("funding", True):
-            btc_f_last, btc_f_avg = get_funding("BTCUSDT")
-            eth_f_last, eth_f_avg = get_funding("ETHUSDT")
-    except: pass
-    try:
-        if CONFIG["features"].get("stablecoins", True): stables_cap = get_stables_cap()
-    except: pass
-
-    today = now_local().strftime("%Y-%m-%d")
-    if btc_d is not None:
-        state["btc_d_hist"] = [x for x in state["btc_d_hist"] if x["date"]!=today]
-        state["btc_d_hist"].append({"date": today, "val": float(btc_d)})
-        state["btc_d_hist"] = state["btc_d_hist"][-180:]
-    if total3_usd is not None:
-        state["total3_hist"] = [x for x in state["total3_hist"] if x["date"]!=today]
-        state["total3_hist"].append({"date": today, "val": float(total3_usd)})
-        state["total3_hist"] = state["total3_hist"][-180:]
-    if stables_cap is not None:
-        state["stable_hist"] = [x for x in state.get("stable_hist", []) if x["date"]!=today]
-        state["stable_hist"].append({"date": today, "val": float(stables_cap)})
-        state["stable_hist"] = state["stable_hist"][-365:]
-
-    # Google Trends (5y) — aktualizuj co N dni
+    # Pozostałe dane
+    _, eth_d, total_usd, total3_usd = get_global_caps()
+    eth_btc = get_eth_btc()
+    gas = get_gas_gwei()
+    dxy, dxy_slope = get_dxy()
+    meme_count, meme_names = count_memecoins_top50(CONFIG["watchlists"]["memecoins"], return_names=True)
+    fng_val, fng_cls = get_fear_greed() if CONFIG["features"].get("fear_greed") else (None, None)
+    vix, vix_slope = get_vix() if CONFIG["features"].get("vix") else (None, None)
+    btc_f_last, btc_f_avg = get_funding("BTCUSDT") if CONFIG["features"].get("funding") else (None, None)
+    eth_f_last, eth_f_avg = get_funding("ETHUSDT") if CONFIG["features"].get("funding") else (None, None)
+    stables_cap = get_stables_cap() if CONFIG["features"].get("stablecoins") else None
+    
+    # Google Trends (5y) — update every N days
+    trends_info = None
     trends_days = int(CONFIG.get("report", {}).get("trends_update_days", 1))
     last_td = state["trends"].get("last_date")
     need_update = (last_td is None) or ((dt.datetime.fromisoformat(last_td).date() + dt.timedelta(days=trends_days)) <= now_local().date())
@@ -564,8 +587,19 @@ def daily_report() -> None:
             trends_info = {"tf": state["trends"].get("tf","today 5-y"), "holo_last": lastv, "holo_peak": peak,
                            "holo_rel": rel, "holo_high": rel >= threshold, "threshold": threshold}
 
-    # Euforia (bazowe 5) + dodatki (F&G, Funding)
+    # Użyj BTC.D z CoinGlass, jeśli jest dostępne, w przeciwnym razie z CoinGecko
+    btc_d_cg = cg_data.get("btc_dominance", {}).get("current") if cg_data else None
+    btc_d_cg_is_float = isinstance(btc_d_cg, (int, float))
+    btc_d_gecko, _, _, _ = get_global_caps()
+    btc_d = btc_d_cg if btc_d_cg_is_float else btc_d_gecko
+
+    # --- 2. OBLICZANIE SYGNAŁÓW ---
+    rsi_cond, dev_cond, vol_cond, p2info = phase2_signals(df)
+    weak_cond, weak_info = phase3_hot_weakness(df)
+    
     eup_hits, eup_details = euphoria_signals(state, btc_d, eth_btc, gas, meme_count, trends_info)
+    p4_hits, p4_details = phase4_signals(state, btc_d, dxy, dxy_slope)
+    
     eup_total = 5 + (1 if CONFIG["features"].get("fear_greed", True) else 0) + (1 if CONFIG["features"].get("funding", True) else 0)
     add_details: List[str] = []
     p3 = CONFIG.get("thresholds", {}).get("phase3", {})
@@ -578,110 +612,89 @@ def daily_report() -> None:
         if last_hi or avg_hi: eup_hits += 1; add_details.append("Funding gorący (BTC/ETH)")
     if add_details: eup_details += add_details
 
-    # Faza 4 (bazowe 2: BTC.D odwrót, DXY↑) + VIX
-    p4_hits, p4_details = phase4_signals(state, btc_d, dxy, dxy_slope)
     p4_total = 2 + (1 if CONFIG["features"].get("vix", True) else 0)
     if CONFIG["features"].get("vix", True) and (vix is not None):
         if vix >= CONFIG.get("thresholds", {}).get("phase4", {}).get("vix_level", 25) and (vix_slope is not None and vix_slope>0):
             p4_hits += 1; p4_details.append(f"VIX {vix:.1f} ↑")
 
-    # Pi Cycle
-    pct = pi_cycle_top_signal()
-
-    # Werdykt
+    # Werdykt fazowy dla HOT
     p2_ok = (rsi_cond + dev_cond + vol_cond) >= 2
     p3b_ok = weak_cond
     p3a_ok = (eup_hits >= 3)
     p4_ok = (p4_hits >= 2)
     p1_ok = not (p2_ok or p3a_ok or p3b_ok or p4_ok)
 
-    # SKŁADANIE RAPORTU
+    # --- 3. TWORZENIE I WYSYŁANIE RAPORTÓW ---
+
+    # --- RAPORT 1: MAKRO RYNKU ---
+    if cg_data:
+        msg_macro = []
+        msg_macro.append(f"*🌡️ Raport Makro Rynku*")
+        msg_macro.append(f"Data: `{today}`")
+        msg_macro.append("")
+        msg_macro.append("*Kluczowe wskaźniki on-chain (CoinGlass):*")
+        
+        def format_cg_line(name, key):
+            indicator = cg_data.get(key)
+            if indicator:
+                curr = indicator.get('current', 'N/A')
+                ref = indicator.get('reference', 'N/A')
+                hit = indicator.get('hit', '')
+                curr_str = f"`{curr:.2f}%`" if key == "btc_dominance" else (f"`{curr:.2f}`" if isinstance(curr, (int, float)) else f"`{curr}`")
+                return f"• {name}: {curr_str} (próg: `{ref}`) {hit}"
+            return f"• {name}: _brak danych_"
+            
+        msg_macro.append(format_cg_line("BTC Dominance", "btc_dominance"))
+        msg_macro.append(format_cg_line("Altcoin Season Index", "alt_season"))
+        msg_macro.append(format_cg_line("Pi Cycle Top", "pi_cycle"))
+        msg_macro.append(format_cg_line("MVRV Z-Score", "mvrv"))
+        msg_macro.append(format_cg_line("Puell Multiple", "puell"))
+        msg_macro.append(format_cg_line("NUPL", "nupl"))
+        msg_macro.append(format_cg_line("Reserve Risk", "reserve_risk"))
+        
+        msg_macro.append("")
+        msg_macro.append("*Inne sygnały rynkowe:*")
+        if total3_usd: msg_macro.append(f"• TOTAL3: `${total3_usd/1e9:,.1f}B`".replace(",", " "))
+        if fng_line := (f"Fear & Greed: `{fng_val}` ({fng_cls or ''})" if fng_val else None): msg_macro.append("• " + fng_line)
+        if dxy: msg_macro.append(f"• DXY: `{dxy:.2f}` " + ("(rosnący)" if (dxy_slope and dxy_slope>0) else "(malejący/flat)"))
+
+        tg_send("\n".join(msg_macro), parse_mode="Markdown")
+        time.sleep(1) # Mała pauza między wiadomościami
+
+    # --- RAPORT 2: ANALIZA HOT ---
+    msg_hot = []
+    msg_hot.append(f"*📊 Analiza Strategii HOT*")
+    msg_hot.append(f"Data: `{today}`")
+    msg_hot.append("")
+    msg_hot.append("*🚦 Werdykt dla HOT:*")
     def yn(b: bool) -> str: return "*Tak ✅*" if b else "Nie —"
-    line_mkt: List[str] = []
-    if p2info.get("hot_eth") is not None: line_mkt.append(f"`HOT/ETH`: `{p2info['hot_eth']:.8f}`")
-    if eth_btc is not None: line_mkt.append(f"`ETH/BTC`: `{eth_btc:.5f}`")
-    if total3_usd is not None: line_mkt.append(f"`TOTAL3`: `${total3_usd/1e9:,.1f}B`".replace(",", " "))
-    if btc_d is not None: line_mkt.append(f"`BTC.D`: `{btc_d:.1f}%`")
-
-    rsi_v = p2info['rsi']; dev = p2info['dev_pct']; vol7 = p2info['vol7']; vol30 = p2info['vol30']
-    ratio = (vol7/vol30) if vol30>0 else 0
-    vol_today = float(df['vol_hot'].iloc[-1]); vol_ratio = ratio; label = volume_label(vol_ratio)
-    hot_vol_line = (f"Wolumen HOT (USDT): dziś `{vol_today:,.0f}` | 7d/30d = `{vol_ratio:.2f}×` ({label})").replace(",", " ")
-
-    ethbtc_zone = format_ethbtc_zone(eth_btc)
-    t3_line = total3_trend_line(state)
+    msg_hot.append(f"• Faza 1 (obserwuj): {yn(p1_ok)}")
+    msg_hot.append(f"• Faza 2 (paraboliczny HOT): {yn(p2_ok)}")
+    msg_hot.append(f"• Faza 3-A (euforia rynku): {yn(p3a_ok)} (`{eup_hits}/{eup_total}`)")
+    msg_hot.append(f"• Faza 3-B (słabość HOT): {yn(p3b_ok)}")
+    msg_hot.append(f"• Faza 4 (dystrybucja): {yn(p4_ok)} (`{p4_hits}/{p4_total}`)")
     
-    trends_line = None
+    msg_hot.append("")
+    msg_hot.append("*Sygnały specyficzne dla HOT:*")
+    msg_hot.append(f"• Cena HOT/ETH: `{p2info['hot_eth']:.8f}`")
+    if p2info.get('hot_eth_change_pct'): msg_hot.append(f"• Zmiana d/d: `{p2info['hot_eth_change_pct']:.2f}%`")
+    if p2info.get('rsi'): msg_hot.append(f"• RSI: `{p2info['rsi']:.1f}`")
+    
+    vol7 = p2info['vol7']; vol30 = p2info['vol30']
+    vol_ratio = (vol7/vol30) if vol30>0 else 0
+    msg_hot.append(f"• Wolumen 7d/30d: `{vol_ratio:.2f}x` ({volume_label(vol_ratio)})")
+    
     if trends_info and trends_info.get("holo_rel") is not None:
-        rel = trends_info["holo_rel"]
-        trends_line = f"Holochain 5y = `{rel:.0f}/100`"
+        msg_hot.append(f"• Google Trends: `{trends_info['holo_rel']:.0f}/100`")
+    if gas_line := format_gas_line(gas): msg_hot.append("• " + gas_line)
 
-    pi_line = None
-    if pct is not None:
-        arrow = "↑" if pct["gap_delta"] > 0 else ("↓" if pct["gap_delta"] < 0 else "→")
-        pi_line = (f"Różnica `{pct['gap']:,.0f}` ({pct['gap_pct']:.2f}%) {arrow} | Sygnał: *{'CROSS ⚠️' if pct['cross'] else 'brak'}*").replace(",", " ")
+    if eup_hits > 0:
+        msg_hot.append("")
+        msg_hot.append("*Aktywne sygnały euforii:* " + "; ".join(eup_details))
 
-    hot_eth_ath = CONFIG.get("overrides", {}).get("hot_eth_ath")
-    ath_line = None
-    if hot_eth_ath and p2info.get("hot_eth") is not None:
-        cur = p2info["hot_eth"]; ath = float(hot_eth_ath)
-        diff_pct = (cur/ath - 1.0)*100.0 if ath>0 else 0.0
-        ath_line = f"HOT/ETH vs ATH: `{diff_pct:.1f}%`"
+    tg_send("\n".join(msg_hot), parse_mode="Markdown")
 
-    gas_line = format_gas_line(gas)
-    def fmt_pct(x: Optional[float]) -> str: return "`—`" if x is None else f"`{x:.3f}%`"
-    fund_line = f"Funding BTC: {fmt_pct(btc_f_last)}/{fmt_pct(btc_f_avg)} | ETH: {fmt_pct(eth_f_last)}/{fmt_pct(eth_f_avg)}"
-    fng_line = None if fng_val is None else f"Fear & Greed: `{fng_val}` ({fng_cls or ''})"
-    s_line, _ = stables_line_and_delta(state)
-    vix_line = None if vix is None else f"VIX: `{vix:.1f}` " + ("(rosnący)" if (vix_slope and vix_slope>0) else "(malejący/flat)")
-
-    meme_line = None
-    if meme_count is not None:
-        meme_thr = CONFIG["thresholds"]["phase3"]["meme_top50_min"]
-        sample = f" (np. {', '.join(meme_names[:3])})" if meme_names else ""
-        meme_line = f"Memecoiny w TOP50 vol: `{meme_count}/50` (próg {meme_thr}){sample}"
-
-    # Sending the report
-    msg: List[str] = []
-    msg.append(f"*📊 Raport dzienny HOT ({CONFIG['schedule']['daily_report_hour']}:00)*")
-    msg.append(f"Data: `{today}`")
-    msg.append("")
-    msg.append("*🚦 Werdykt:*")
-    msg.append(f"• Faza 1 (obserwuj): {yn(p1_ok)}")
-    msg.append(f"• Faza 2 (paraboliczny HOT): {yn(p2_ok)}")
-    msg.append(f"• Faza 3-A (euforia rynku): {yn(p3a_ok)} (`{eup_hits}/{eup_total}`)")
-    msg.append(f"• Faza 3-B (słabość HOT): {yn(p3b_ok)}")
-    msg.append(f"• Faza 4 (dystrybucja): {yn(p4_ok)} (`{p4_hits}/{p4_total}`)")
-    msg.append("")
-    msg.append("*Kluczowe sygnały:*")
-    if line_mkt: msg.append("• " + " | ".join(line_mkt))
-    if t3_line: msg.append("• " + t3_line)
-    if ethbtc_zone: msg.append("• " + ethbtc_zone)
-    if meme_line: msg.append("• " + meme_line)
-    msg.append("")
-    msg.append("*Analiza HOT/ETH:*")
-    if p2info.get("rsi") is not None:
-        msg.append(f"• RSI: `{p2info['rsi']:.1f}` | Zmiana d/d: `{p2info['rsi_delta']:.1f}`")
-    if p2info.get("hot_eth_change_pct") is not None:
-        msg.append(f"• Zmiana ceny d/d: `{p2info['hot_eth_change_pct']:.2f}%`")
-    if ath_line: msg.append(f"• {ath_line}")
-    msg.append(f"• {hot_vol_line}")
-    msg.append("")
-    msg.append("*Sygnały makro:*")
-    if trends_line: msg.append("• Google Trends: " + trends_line)
-    if dxy is not None:
-        msg.append(f"• DXY: `{dxy:.2f}` " + ("(rosnący)" if (dxy_slope and dxy_slope>0) else "(malejący/flat)"))
-    if gas_line: msg.append("• " + gas_line)
-    if fng_line: msg.append("• " + fng_line)
-    if CONFIG["features"].get("funding", True): msg.append("• " + fund_line)
-    if CONFIG["features"].get("stablecoins", True) and s_line: msg.append("• " + s_line)
-    if vix_line: msg.append("• " + vix_line)
-    if pi_line: msg.append("• Pi Cycle: " + pi_line)
-    if eup_hits>0: msg.append("• Sygnały euforii: " + "; ".join(eup_details))
-    
-    # Final send call with Markdown enabled
-    tg_send("\n".join(msg), parse_mode="Markdown")
-
+    # --- 4. ZAPIS DO CSV I ALERTY ---
     # CSV
     row = {
         "date": today,
@@ -699,29 +712,24 @@ def daily_report() -> None:
         "gas_fast": gas["fast"] if (gas and isinstance(gas,dict) and gas.get("fast") is not None) else "",
         "gas_base": gas["base"] if (gas and isinstance(gas,dict) and gas.get("base") is not None) else "",
         "dxy": round(dxy,2) if dxy is not None else "",
-        # PMI usunięte – zostawiamy puste kolumny dla kompatybilności CSV:
-        "pmi": "",
-        "pmi_series": "",
         "fng": fng_val if fng_val is not None else "",
         "vix": round(vix,1) if vix is not None else "",
-        "btc_f_last": round(btc_f_last,3) if btc_f_last is not None else "",
-        "btc_f_avg": round(btc_f_avg,3) if btc_f_avg is not None else "",
-        "eth_f_last": round(eth_f_last,3) if eth_f_last is not None else "",
-        "eth_f_avg": round(eth_f_avg,3) if eth_f_avg is not None else "",
         "stables_cap_b": round(stables_cap/1e9,1) if stables_cap is not None else "",
         "meme_top50": meme_count if meme_count is not None else "",
-        "pi_gap": round(pct["gap"],0) if pct is not None else "",
-        "pi_gap_delta": round(pct["gap_delta"],0) if pct is not None else "",
-        "pi_gap_pct": round(pct["gap_pct"],2) if (pct and pct["gap_pct"] is not None) else "",
+        "pi_cycle": cg_data.get('pi_cycle',{}).get('current') if cg_data else "",
+        "mvrv_z": cg_data.get('mvrv',{}).get('current') if cg_data else "",
+        "puell": cg_data.get('puell',{}).get('current') if cg_data else "",
+        "nupl": cg_data.get('nupl',{}).get('current') if cg_data else "",
+        "reserve_risk": cg_data.get('reserve_risk',{}).get('current') if cg_data else "",
+        "alt_season": cg_data.get('alt_season',{}).get('current') if cg_data else "",
         "euphoria_hits": eup_hits, "euphoria_total": eup_total,
-        "phase4_hits": p4_hits, "phase4_total": p4_total,
-        "trends_last_5y": round(trends_info["holo_last"],0) if (trends_info and trends_info.get("holo_last") is not None) else "",
-        "trends_peak_5y": round(trends_info["holo_peak"],0) if (trends_info and trends_info.get("holo_peak") is not None) else "",
-        "trends_rel_5y": round(trends_info["holo_rel"],0) if (trends_info and trends_info.get("holo_rel") is not None) else ""
+        "phase4_hits": p4_hits, "phase4_total": p4_total
     }
-    log_daily_csv(today, row)
+    # Filtrujemy puste klucze z row, jeśli jakieś API zawiodło
+    final_row = {k: v for k, v in row.items() if k}
+    if final_row: log_daily_csv(today, final_row)
 
-    # Alerty
+    # Alerts
     state = load_state()
     if p2_ok and throttle(state, "phase2", hours=12):
         tg_send("⚠️ Faza 2: HOT wygląda na paraboliczny (≥2/3). Plan: sprzedać 20% w 3–5 krokach."); mark_alert(state, "phase2")
@@ -732,7 +740,7 @@ def daily_report() -> None:
     if p4_ok and throttle(state, "phase4", hours=24):
         tg_send("🔴 Faza 4: Sygn. odwrotu (≥2/3). Domknij ostatnie 20%."); mark_alert(state, "phase4")
 
-    # Dodatkowe alerty
+    # Additional alerts
     if (CONFIG["features"].get("fear_greed", True)
         and fng_val is not None
         and fng_val >= CONFIG.get("thresholds", {}).get("phase3", {}).get("fng_greed", 80)
