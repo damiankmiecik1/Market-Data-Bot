@@ -39,9 +39,8 @@ TG_CHAT: str = CONFIG["telegram"].get("chat_ids")
 if not TG_CHAT:
     TG_CHAT = [CONFIG["telegram"]["chat_id"]]
 ETHERSCAN_KEY: str = os.getenv("ETHERSCAN_KEY", "")
-COINGLASS_API_KEY: str = os.getenv("COINGLASS_API_KEY", "")
 
-# Global HTTP session z retry/backoff (soft errors)
+# Global HTTP session with retry/backoff (soft errors)
 _S = requests.Session()
 _retry = Retry(
     total=3,
@@ -55,10 +54,11 @@ _S.headers.update({"User-Agent": "hot-exit-bot/8.7 (+github.com/your/repo)"})
 
 
 def http_json(url: str, method: str = "GET", params: Optional[Dict[str, Any]] = None,
-              data: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Optional[Dict[str, Any]]:
-    # Nie rzuca wyjątków na 4xx/5xx — zwraca json/tekst z kodem statusu
+              data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, 
+              timeout: int = 15) -> Optional[Dict[str, Any]]:
+    # Does not raise exceptions on 4xx/5xx — returns json/text with status code
     try:
-        r = _S.request(method, url, params=params, data=data, timeout=timeout)
+        r = _S.request(method, url, params=params, data=data, headers=headers, timeout=timeout)
     except requests.RequestException as e:
         return {"_exc": str(e), "_http_status": None}
     try:
@@ -75,6 +75,7 @@ def http_json(url: str, method: str = "GET", params: Optional[Dict[str, Any]] = 
 
 def now_local() -> dt.datetime:
     return dt.datetime.now(TZ)
+
 
 def tg_send(text, disable_preview=True, parse_mode=None):
     try:
@@ -134,11 +135,11 @@ def save_state(state: Dict[str, Any]) -> None:
         os.replace(tmp, STATE_FILE)
 
 
-# CCXT cache + rynków + OHLCV cache
+# CCXT cache + markets + OHLCV cache
 CCXT_CACHE: Dict[str, Any] = {}
 MARKETS_LOADED: set = set()
 OHLCV_CACHE: Dict[Any, Any] = {}
-OHLCV_TTL_SEC = 15*60  # przy intraday można dać 1800–3600 dla mniejszego zużycia
+OHLCV_TTL_SEC = 15*60  # with intraday might be 1800-3600 for less usage
 
 
 def get_ccxt(exchange: str):
@@ -297,58 +298,6 @@ def google_trends_scores(timeframe: Optional[str] = None) -> Optional[Dict[str, 
                 "holofuel_last": holoFuel_last, "threshold": threshold}
     except Exception: return None
 
-# NOWA FUNKCJA DO DODANIA W bot.py
-
-def get_coinglass_indicators() -> Optional[Dict[str, Dict[str, Any]]]:
-    """Pobiera kluczowe wskaźniki makro z API CoinGlass, używając klucza API."""
-    if not COINGLASS_API_KEY:
-        print("Brak klucza API dla CoinGlass w pliku .env. Pomijam pobieranie wskaźników.")
-        return None
-        
-    try:
-        # UWAGA: Sprawdź w dokumentacji CoinGlass, czy ten URL i nazwa nagłówka są poprawne!
-        url = "https://open-api.coinglass.com/public/v2/indicator/bull_market_indicator"
-        headers = {"coinglass-api-key": COINGLASS_API_KEY}
-        
-        j = http_json(url, headers=headers, timeout=20)
-
-        if not j or not j.get("success") or not isinstance(j.get("data"), list):
-            print("CoinGlass API error: Brak danych lub nieprawidłowy format.")
-            return None
-
-        # Słownik mapujący nazwy z API na nasze uproszczone klucze
-        INDICATOR_MAP = {
-            "MVRV Z-Score": "mvrv",
-            "Puell Multiple": "puell",
-            "Net Unrealized Profit/Loss(NUPL)": "nupl",
-            "Reserve Risk": "reserve_risk",
-            "Altcoin Season Index": "alt_season",
-            "Pi Cycle Top Indicator": "pi_cycle",
-            "Bitcoin Dominance": "btc_dominance"
-        }
-
-        processed_data = {}
-        for item in j["data"]:
-            api_name = item.get("indicatorName")
-            if api_name in INDICATOR_MAP:
-                key = INDICATOR_MAP[api_name]
-                try:
-                    # Próbujemy przekonwertować na liczbę, aby ułatwić formatowanie
-                    current_val = float(item.get("currentValue"))
-                except (ValueError, TypeError):
-                    current_val = item.get("currentValue") 
-
-                processed_data[key] = {
-                    "current": current_val,
-                    "reference": item.get("referenceValue", "N/A"),
-                    "hit": "✅" if item.get("hitOrNot") else "❌"
-                }
-        return processed_data
-            
-    except Exception as e:
-        print(f"Błąd podczas pobierania wskaźników z CoinGlass: {e}")
-        return None
-
 
 def phase2_signals(df: pd.DataFrame) -> Tuple[bool, bool, bool, Dict[str, Any]]:
     price = df["hot_eth"]; r = rsi(price)
@@ -407,12 +356,6 @@ def euphoria_signals(state: Dict[str, Any], btc_d: Optional[float], eth_btc: Opt
 
 
 def phase4_signals(state: Dict[str, Any], btc_d: Optional[float], dxy: Optional[float], dxy_slope: Optional[float]) -> Tuple[int, List[str]]:
-    """
-    Faza 4 bez PMI: sygnały bazowe:
-    - BTC.D odwrót w górę względem ostatniego minimum (np. +3 p.p.)
-    - DXY wysoko i rośnie
-    VIX dokładamy poza funkcją (jako dodatkowy sygnał).
-    """
     hits = 0; details: List[str] = []
     p4 = CONFIG.get("thresholds", {}).get("phase4", {})
     btc_vals = [it["val"] for it in state.get("btc_d_hist", [])[-28:]]
@@ -470,7 +413,7 @@ def volume_label(ratio: float) -> str:
     return "bardzo słaby"
 
 
-# Dodatkowe wskaźniki
+# Additional indicators
 def get_fear_greed() -> Tuple[Optional[int], Optional[str]]:
     try:
         j = http_json("https://api.alternative.me/fng/?limit=2", timeout=10)
@@ -538,37 +481,31 @@ def mark_alert(state: Dict[str, Any], key: str) -> None:
     state["alerts"][key] = dt.datetime.utcnow().isoformat(); save_state(state)
 
 
-# CAŁKOWICIE ZASTĄP STARĄ FUNKCJĘ daily_report PONIŻSZĄ WERSJĄ
-
 def daily_report() -> None:
-    # --- 1. POBIERANIE DANYCH ---
+    # --- 1. POBIERANIE DANYCH (POWRÓT DO DARMOWYCH ŹRÓDEŁ) ---
     state = load_state()
     today = now_local().strftime("%Y-%m-%d")
-
-    # Dane kluczowe dla HOT
+    
     df = synthetic_hot_eth(tf="1d", limit=200)
     if df is None or len(df)<60:
-        tg_send("⚠️ Brak danych HOT/ETH. Raport nie może zostać wygenerowany."); return
-    
-    # Dane makro z CoinGlass
-    cg_data = get_coinglass_indicators()
-    if not cg_data:
-        tg_send("⚠️ Brak danych z CoinGlass. Raport makro nie może zostać wygenerowany.")
-        # Można kontynuować z raportem HOT, ale sygnały mogą być niepełne
+        tg_send("⚠️ Brak danych HOT/ETH. Raport może być niepełny."); return
 
-    # Pozostałe dane
-    _, eth_d, total_usd, total3_usd = get_global_caps()
+    # Przywracamy stare, działające źródła danych
+    rsi_cond, dev_cond, vol_cond, p2info = phase2_signals(df)
+    weak_cond, weak_info = phase3_hot_weakness(df)
+    btc_d, eth_d, total_usd, total3_usd = get_global_caps()
     eth_btc = get_eth_btc()
     gas = get_gas_gwei()
     dxy, dxy_slope = get_dxy()
     meme_count, meme_names = count_memecoins_top50(CONFIG["watchlists"]["memecoins"], return_names=True)
-    fng_val, fng_cls = get_fear_greed() if CONFIG["features"].get("fear_greed") else (None, None)
-    vix, vix_slope = get_vix() if CONFIG["features"].get("vix") else (None, None)
-    btc_f_last, btc_f_avg = get_funding("BTCUSDT") if CONFIG["features"].get("funding") else (None, None)
-    eth_f_last, eth_f_avg = get_funding("ETHUSDT") if CONFIG["features"].get("funding") else (None, None)
-    stables_cap = get_stables_cap() if CONFIG["features"].get("stablecoins") else None
+    fng_val, fng_cls = get_fear_greed() if CONFIG["features"].get("fear_greed", True) else (None, None)
+    vix, vix_slope = get_vix() if CONFIG["features"].get("vix", True) else (None, None)
+    btc_f_last, btc_f_avg = get_funding("BTCUSDT") if CONFIG["features"].get("funding", True) else (None, None)
+    eth_f_last, eth_f_avg = get_funding("ETHUSDT") if CONFIG["features"].get("funding", True) else (None, None)
+    stables_cap = get_stables_cap() if CONFIG["features"].get("stablecoins", True) else None
+    pct = pi_cycle_top_signal() # Przywracamy naszą własną funkcję Pi Cycle
     
-    # Google Trends (5y) — update every N days
+    # Logika Google Trends (bez zmian)
     trends_info = None
     trends_days = int(CONFIG.get("report", {}).get("trends_update_days", 1))
     last_td = state["trends"].get("last_date")
@@ -587,16 +524,7 @@ def daily_report() -> None:
             trends_info = {"tf": state["trends"].get("tf","today 5-y"), "holo_last": lastv, "holo_peak": peak,
                            "holo_rel": rel, "holo_high": rel >= threshold, "threshold": threshold}
 
-    # Użyj BTC.D z CoinGlass, jeśli jest dostępne, w przeciwnym razie z CoinGecko
-    btc_d_cg = cg_data.get("btc_dominance", {}).get("current") if cg_data else None
-    btc_d_cg_is_float = isinstance(btc_d_cg, (int, float))
-    btc_d_gecko, _, _, _ = get_global_caps()
-    btc_d = btc_d_cg if btc_d_cg_is_float else btc_d_gecko
-
-    # --- 2. OBLICZANIE SYGNAŁÓW ---
-    rsi_cond, dev_cond, vol_cond, p2info = phase2_signals(df)
-    weak_cond, weak_info = phase3_hot_weakness(df)
-    
+    # --- 2. OBLICZANIE SYGNAŁÓW (BEZ ZMIAN) ---
     eup_hits, eup_details = euphoria_signals(state, btc_d, eth_btc, gas, meme_count, trends_info)
     p4_hits, p4_details = phase4_signals(state, btc_d, dxy, dxy_slope)
     
@@ -617,85 +545,46 @@ def daily_report() -> None:
         if vix >= CONFIG.get("thresholds", {}).get("phase4", {}).get("vix_level", 25) and (vix_slope is not None and vix_slope>0):
             p4_hits += 1; p4_details.append(f"VIX {vix:.1f} ↑")
 
-    # Werdykt fazowy dla HOT
     p2_ok = (rsi_cond + dev_cond + vol_cond) >= 2
     p3b_ok = weak_cond
     p3a_ok = (eup_hits >= 3)
     p4_ok = (p4_hits >= 2)
     p1_ok = not (p2_ok or p3a_ok or p3b_ok or p4_ok)
 
-    # --- 3. TWORZENIE I WYSYŁANIE RAPORTÓW ---
-
-    # --- RAPORT 1: MAKRO RYNKU ---
-    if cg_data:
-        msg_macro = []
-        msg_macro.append(f"*🌡️ Raport Makro Rynku*")
-        msg_macro.append(f"Data: `{today}`")
-        msg_macro.append("")
-        msg_macro.append("*Kluczowe wskaźniki on-chain (CoinGlass):*")
-        
-        def format_cg_line(name, key):
-            indicator = cg_data.get(key)
-            if indicator:
-                curr = indicator.get('current', 'N/A')
-                ref = indicator.get('reference', 'N/A')
-                hit = indicator.get('hit', '')
-                curr_str = f"`{curr:.2f}%`" if key == "btc_dominance" else (f"`{curr:.2f}`" if isinstance(curr, (int, float)) else f"`{curr}`")
-                return f"• {name}: {curr_str} (próg: `{ref}`) {hit}"
-            return f"• {name}: _brak danych_"
-            
-        msg_macro.append(format_cg_line("BTC Dominance", "btc_dominance"))
-        msg_macro.append(format_cg_line("Altcoin Season Index", "alt_season"))
-        msg_macro.append(format_cg_line("Pi Cycle Top", "pi_cycle"))
-        msg_macro.append(format_cg_line("MVRV Z-Score", "mvrv"))
-        msg_macro.append(format_cg_line("Puell Multiple", "puell"))
-        msg_macro.append(format_cg_line("NUPL", "nupl"))
-        msg_macro.append(format_cg_line("Reserve Risk", "reserve_risk"))
-        
-        msg_macro.append("")
-        msg_macro.append("*Inne sygnały rynkowe:*")
-        if total3_usd: msg_macro.append(f"• TOTAL3: `${total3_usd/1e9:,.1f}B`".replace(",", " "))
-        if fng_line := (f"Fear & Greed: `{fng_val}` ({fng_cls or ''})" if fng_val else None): msg_macro.append("• " + fng_line)
-        if dxy: msg_macro.append(f"• DXY: `{dxy:.2f}` " + ("(rosnący)" if (dxy_slope and dxy_slope>0) else "(malejący/flat)"))
-
-        tg_send("\n".join(msg_macro), parse_mode="Markdown")
-        time.sleep(1) # Mała pauza między wiadomościami
-
-    # --- RAPORT 2: ANALIZA HOT ---
-    msg_hot = []
-    msg_hot.append(f"*📊 Analiza Strategii HOT*")
-    msg_hot.append(f"Data: `{today}`")
-    msg_hot.append("")
-    msg_hot.append("*🚦 Werdykt dla HOT:*")
+    # --- 3. TWORZENIE JEDNEGO, KOMPLETNEGO RAPORTU Z NOWYM FORMATOWANIEM ---
+    msg = []
+    msg.append(f"*📊 Raport Dzienny HOT ({CONFIG['schedule']['daily_report_hour']}:00)*")
+    msg.append(f"Data: `{today}`")
+    msg.append("")
+    msg.append("*🚦 Werdykt:*")
     def yn(b: bool) -> str: return "*Tak ✅*" if b else "Nie —"
-    msg_hot.append(f"• Faza 1 (obserwuj): {yn(p1_ok)}")
-    msg_hot.append(f"• Faza 2 (paraboliczny HOT): {yn(p2_ok)}")
-    msg_hot.append(f"• Faza 3-A (euforia rynku): {yn(p3a_ok)} (`{eup_hits}/{eup_total}`)")
-    msg_hot.append(f"• Faza 3-B (słabość HOT): {yn(p3b_ok)}")
-    msg_hot.append(f"• Faza 4 (dystrybucja): {yn(p4_ok)} (`{p4_hits}/{p4_total}`)")
+    msg.append(f"• Faza 1 (obserwuj): {yn(p1_ok)}")
+    msg.append(f"• Faza 2 (paraboliczny HOT): {yn(p2_ok)}")
+    msg.append(f"• Faza 3-A (euforia rynku): {yn(p3a_ok)} (`{eup_hits}/{eup_total}`)")
+    msg.append(f"• Faza 3-B (słabość HOT): {yn(p3b_ok)}")
+    msg.append(f"• Faza 4 (dystrybucja): {yn(p4_ok)} (`{p4_hits}/{p4_total}`)")
     
-    msg_hot.append("")
-    msg_hot.append("*Sygnały specyficzne dla HOT:*")
-    msg_hot.append(f"• Cena HOT/ETH: `{p2info['hot_eth']:.8f}`")
-    if p2info.get('hot_eth_change_pct'): msg_hot.append(f"• Zmiana d/d: `{p2info['hot_eth_change_pct']:.2f}%`")
-    if p2info.get('rsi'): msg_hot.append(f"• RSI: `{p2info['rsi']:.1f}`")
+    msg.append("")
+    msg.append("*Kluczowe sygnały rynkowe:*")
+    line_mkt = []
+    if btc_d is not None: line_mkt.append(f"`BTC.D`: `{btc_d:.1f}%`")
+    if total3_usd is not None: line_mkt.append(f"`TOTAL3`: `${total3_usd/1e9:,.1f}B`".replace(",", " "))
+    msg.append("• " + " | ".join(line_mkt))
     
-    vol7 = p2info['vol7']; vol30 = p2info['vol30']
-    vol_ratio = (vol7/vol30) if vol30>0 else 0
-    msg_hot.append(f"• Wolumen 7d/30d: `{vol_ratio:.2f}x` ({volume_label(vol_ratio)})")
+    if pi_line := ( (f"Pi Cycle: Różnica `{pct['gap']:,.0f}` ({pct['gap_pct']:.2f}%) | Sygnał: *{'CROSS ⚠️' if pct['cross'] else 'brak'}*").replace(",", " ") if pct and pct.get('gap') is not None and pct.get('gap_pct') is not None else "Pi Cycle: _brak danych_"): msg.append("• " + pi_line)
+    if fng_line := (f"Fear & Greed: `{fng_val}` ({fng_cls or ''})" if fng_val else None): msg.append("• " + fng_line)
     
-    if trends_info and trends_info.get("holo_rel") is not None:
-        msg_hot.append(f"• Google Trends: `{trends_info['holo_rel']:.0f}/100`")
-    if gas_line := format_gas_line(gas): msg_hot.append("• " + gas_line)
+    msg.append("")
+    msg.append("*Analiza HOT:*")
+    msg.append(f"• Cena HOT/ETH: `{p2info['hot_eth']:.8f}`")
+    if p2info.get('hot_eth_change_pct'): msg.append(f"• Zmiana d/d: `{p2info['hot_eth_change_pct']:.2f}%`")
+    if p2info.get('rsi'): msg.append(f"• RSI: `{p2info['rsi']:.1f}`")
+    vol_ratio = (p2info['vol7'] / p2info['vol30']) if p2info.get('vol30', 0) > 0 else 0
+    msg.append(f"• Wolumen 7d/30d: `{vol_ratio:.2f}x` ({volume_label(vol_ratio)})")
+    
+    tg_send("\n".join(msg), parse_mode="Markdown")
 
-    if eup_hits > 0:
-        msg_hot.append("")
-        msg_hot.append("*Aktywne sygnały euforii:* " + "; ".join(eup_details))
-
-    tg_send("\n".join(msg_hot), parse_mode="Markdown")
-
-    # --- 4. ZAPIS DO CSV I ALERTY ---
-    # CSV
+    # --- 4. ZAPIS DO CSV I ALERTY (bez zmian) ---
     row = {
         "date": today,
         "hot_eth": round(p2info["hot_eth"],8),
@@ -712,22 +601,26 @@ def daily_report() -> None:
         "gas_fast": gas["fast"] if (gas and isinstance(gas,dict) and gas.get("fast") is not None) else "",
         "gas_base": gas["base"] if (gas and isinstance(gas,dict) and gas.get("base") is not None) else "",
         "dxy": round(dxy,2) if dxy is not None else "",
+        "pmi": "",
+        "pmi_series": "",
         "fng": fng_val if fng_val is not None else "",
         "vix": round(vix,1) if vix is not None else "",
+        "btc_f_last": round(btc_f_last,3) if btc_f_last is not None else "",
+        "btc_f_avg": round(btc_f_avg,3) if btc_f_avg is not None else "",
+        "eth_f_last": round(eth_f_last,3) if eth_f_last is not None else "",
+        "eth_f_avg": round(eth_f_avg,3) if eth_f_avg is not None else "",
         "stables_cap_b": round(stables_cap/1e9,1) if stables_cap is not None else "",
         "meme_top50": meme_count if meme_count is not None else "",
-        "pi_cycle": cg_data.get('pi_cycle',{}).get('current') if cg_data else "",
-        "mvrv_z": cg_data.get('mvrv',{}).get('current') if cg_data else "",
-        "puell": cg_data.get('puell',{}).get('current') if cg_data else "",
-        "nupl": cg_data.get('nupl',{}).get('current') if cg_data else "",
-        "reserve_risk": cg_data.get('reserve_risk',{}).get('current') if cg_data else "",
-        "alt_season": cg_data.get('alt_season',{}).get('current') if cg_data else "",
+        "pi_gap": round(pct["gap"],0) if pct is not None and pct.get("gap") is not None else "",
+        "pi_gap_delta": round(pct["gap_delta"],0) if pct is not None and pct.get("gap_delta") is not None else "",
+        "pi_gap_pct": round(pct["gap_pct"],2) if (pct and pct.get("gap_pct") is not None) else "",
         "euphoria_hits": eup_hits, "euphoria_total": eup_total,
-        "phase4_hits": p4_hits, "phase4_total": p4_total
+        "phase4_hits": p4_hits, "phase4_total": p4_total,
+        "trends_last_5y": round(trends_info["holo_last"],0) if (trends_info and trends_info.get("holo_last") is not None) else "",
+        "trends_peak_5y": round(trends_info["holo_peak"],0) if (trends_info and trends_info.get("holo_peak") is not None) else "",
+        "trends_rel_5y": round(trends_info["holo_rel"],0) if (trends_info and trends_info.get("holo_rel") is not None) else ""
     }
-    # Filtrujemy puste klucze z row, jeśli jakieś API zawiodło
-    final_row = {k: v for k, v in row.items() if k}
-    if final_row: log_daily_csv(today, final_row)
+    log_daily_csv(today, row)
 
     # Alerts
     state = load_state()
@@ -779,7 +672,7 @@ if __name__ == "__main__":
     )
     sched.add_job(daily_report, CronTrigger(hour=CONFIG["schedule"]["daily_report_hour"], minute=0))
 
-    # Jeśli chcesz TYLKO raport dzienny, ustaw intraday_minutes na 0 w config.json
+    # If you want ONLY daily report, set intraday_minutes to 0 in config.json
     if CONFIG["schedule"].get("intraday_minutes", 0) and CONFIG["schedule"]["intraday_minutes"] > 0:
         sched.add_job(intraday_alerts, "interval", minutes=CONFIG["schedule"]["intraday_minutes"])
 
