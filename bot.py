@@ -514,6 +514,19 @@ def daily_report() -> None:
     eth_f_last, eth_f_avg = get_funding("ETHUSDT") if CONFIG["features"].get("funding", True) else (None, None)
     stables_cap = get_stables_cap() if CONFIG["features"].get("stablecoins", True) else None
     pct = pi_cycle_top_signal()
+
+    if btc_d is not None:
+        state["btc_d_hist"] = [x for x in state["btc_d_hist"] if x["date"]!=today]
+        state["btc_d_hist"].append({"date": today, "val": float(btc_d)})
+        state["btc_d_hist"] = state["btc_d_hist"][-180:]
+    if total3_usd is not None:
+        state["total3_hist"] = [x for x in state["total3_hist"] if x["date"]!=today]
+        state["total3_hist"].append({"date": today, "val": float(total3_usd)})
+        state["total3_hist"] = state["total3_hist"][-180:]
+    if stables_cap is not None:
+        state["stable_hist"] = [x for x in state.get("stable_hist", []) if x["date"]!=today]
+        state["stable_hist"].append({"date": today, "val": float(stables_cap)})
+        state["stable_hist"] = state["stable_hist"][-365:]
     
     # Logika Google Trends
     trends_info = None
@@ -536,7 +549,6 @@ def daily_report() -> None:
     eup_hits, eup_details = euphoria_signals(state, btc_d, eth_btc, gas, meme_count, trends_info)
     p4_hits, p4_details = phase4_signals(state, btc_d, dxy, dxy_slope)
     
-    # Dodatkowe sygnały
     eup_total = 5 + (1 if CONFIG["features"].get("fear_greed", True) else 0) + (1 if CONFIG["features"].get("funding", True) else 0)
     add_details: List[str] = []
     p3 = CONFIG.get("thresholds", {}).get("phase3", {})
