@@ -457,9 +457,20 @@ def get_stables_cap() -> Optional[float]:
 
 def stables_line_and_delta(state: Dict[str, Any]) -> Tuple[str, Optional[float]]:
     hist = state.get("stable_hist", [])
-    if len(hist) < 8: return "Stablecoins cap: brak wystarczającej historii (min 8 dni)", None
-    cur = float(hist[-1]["val"]); prev7 = float(hist[-8]["val"]); delta7 = ((cur/prev7)-1.0)*100.0 if prev7>0 else None
-    return (f"Stablecoins cap: ${cur/1e9:,.1f}B (7d Δ {delta7:+.2f}%)".replace(",", " ")), delta7
+    if not hist:
+        return "Stablecoins cap: brak danych", None
+
+    cur = float(hist[-1]["val"])
+    line = f"Stablecoins cap: `${cur/1e9:,.1f}B`".replace(",", " ")
+    
+    delta7 = None
+    if len(hist) >= 8:
+        prev7 = float(hist[-8]["val"])
+        delta7 = ((cur/prev7)-1.0)*100.0 if prev7 > 0 else None
+        if delta7 is not None:
+            line += f" (7d Δ {delta7:+.2f}%)"
+            
+    return line, delta7
 
 
 def log_daily_csv(date_str: str, data: Dict[str, Any]) -> None:
@@ -499,15 +510,27 @@ def daily_report() -> None:
     meme_count, meme_names = count_memecoins_top50(CONFIG["watchlists"]["memecoins"], return_names=True)
     fng_val, fng_cls = get_fear_greed() if CONFIG["features"].get("fear_greed", True) else (None, None)
     vix, vix_slope = get_vix() if CONFIG["features"].get("vix", True) else (None, None)
-    
-    # --- POPRAWKA: PRZYWRÓCENIE POBIERANIA STABLES_CAP ---
+    btc_f_last, btc_f_avg = get_funding("BTCUSDT") if CONFIG["features"].get("funding", True) else (None, None)
+    eth_f_last, eth_f_avg = get_funding("ETHUSDT") if CONFIG["features"].get("funding", True) else (None, None)
     stables_cap = get_stables_cap() if CONFIG["features"].get("stablecoins", True) else None
-    
     pct = pi_cycle_top_signal()
     
-    # Logika Google Trends (bez zmian)
+    # Logika Google Trends
     trends_info = None
-    # ... wklej tutaj swoją logikę Google Trends, jeśli ją usunąłeś ...
+    trends_days = int(CONFIG.get("report", {}).get("trends_update_days", 1))
+    last_td = state["trends"].get("last_date")
+    need_update = (last_td is None) or ((dt.datetime.fromisoformat(last_td).date() + dt.timedelta(days=trends_days)) <= now_local().date())
+    if CONFIG["features"].get("google_trends", True) and need_update:
+        t = google_trends_scores(timeframe=CONFIG.get("report", {}).get("trends_timeframe", "today 5-y"))
+        if t:
+            state["trends"] = {"last_date": now_local().isoformat(), "holo_last": t["holo_last"], "holo_peak": t["holo_peak"], "holo_rel": t["holo_rel"], "tf": t["tf"], "last_above": t["holo_high"]}
+            trends_info = t
+            save_state(state)
+    else:
+        if state["trends"].get("holo_rel") is not None:
+            rel = state["trends"]["holo_rel"]; peak = state["trends"]["holo_peak"]; lastv = state["trends"]["holo_last"]
+            threshold = CONFIG.get("report", {}).get("trends_high_threshold", 40)
+            trends_info = {"tf": state["trends"].get("tf","today 5-y"), "holo_last": lastv, "holo_peak": peak, "holo_rel": rel, "holo_high": rel >= threshold, "threshold": threshold}
 
     # --- 2. OBLICZANIE SYGNAŁÓW ---
     eup_hits, eup_details = euphoria_signals(state, btc_d, eth_btc, gas, meme_count, trends_info)
@@ -515,8 +538,20 @@ def daily_report() -> None:
     
     # Dodatkowe sygnały
     eup_total = 5 + (1 if CONFIG["features"].get("fear_greed", True) else 0) + (1 if CONFIG["features"].get("funding", True) else 0)
+    add_details: List[str] = []
+    p3 = CONFIG.get("thresholds", {}).get("phase3", {})
+    if CONFIG["features"].get("fear_greed", True) and fng_val is not None and fng_val >= p3.get("fng_greed", 80):
+        eup_hits += 1; add_details.append(f"F&G {fng_val} (Greed)")
+    if CONFIG["features"].get("funding", True):
+        fl = [x for x in [btc_f_last, eth_f_last] if x is not None]; fa = [x for x in [btc_f_avg, eth_f_avg] if x is not None]
+        last_hi = any(x >= p3.get("funding_last_pct", 0.05) for x in fl) if fl else False
+        avg_hi = any(x >= p3.get("funding_avg_pct", 0.03) for x in fa) if fa else False
+        if last_hi or avg_hi: eup_hits += 1; add_details.append("Funding gorący (BTC/ETH)")
+    if add_details: eup_details.extend(add_details)
+
     p4_total = 2 + (1 if CONFIG["features"].get("vix", True) else 0)
-    # ... i reszta logiki dla eup_hits i p4_hits ...
+    if CONFIG["features"].get("vix", True) and vix is not None and vix_slope is not None and vix >= CONFIG.get("thresholds", {}).get("phase4", {}).get("vix_level", 25) and vix_slope > 0:
+        p4_hits += 1; p4_details.append(f"VIX {vix:.1f} ↑")
 
     p2_ok = (rsi_cond + dev_cond + vol_cond) >= 2
     p3b_ok = weak_cond
@@ -532,8 +567,11 @@ def daily_report() -> None:
         diff_pct = (cur/ath - 1.0)*100.0 if ath > 0 else 0.0
         ath_line = f"vs ATH: `{diff_pct:.1f}%`"
     
-    # --- POPRAWKA: PRZYWRÓCENIE LINII STABLES_CAP ---
     s_line, _ = stables_line_and_delta(state)
+    trends_line = f"Google Trends: `{trends_info['holo_rel']:.0f}/100`" if trends_info else "Google Trends: _brak danych_"
+    ethbtc_zone_line = format_ethbtc_zone(eth_btc)
+    gas_line = format_gas_line(gas)
+    meme_line = f"Memecoiny w TOP50: `{meme_count}`" if meme_count is not None else "Memecoiny: _brak danych_"
 
     msg = []
     msg.append(f"*📊 Raport Dzienny HOT ({CONFIG['schedule']['daily_report_hour']}:00)*")
@@ -556,7 +594,8 @@ def daily_report() -> None:
     
     if pi_line := ( (f"Pi Cycle: Różnica `{pct['gap']:,.0f}` ({pct['gap_pct']:.2f}%) | Sygnał: *{'CROSS ⚠️' if pct['cross'] else 'brak'}*").replace(",", " ") if pct and pct.get('gap') is not None and pct.get('gap_pct') is not None else "Pi Cycle: _brak danych_"): msg.append("• " + pi_line)
     if fng_line := (f"Fear & Greed: `{fng_val}` ({fng_cls or ''})" if fng_val else None): msg.append("• " + fng_line)
-    if s_line: msg.append("• " + s_line) # <-- DODANA LINIA DO RAPORTU
+    if s_line: msg.append("• " + s_line)
+    if ethbtc_zone_line: msg.append("• " + ethbtc_zone_line)
 
     msg.append("")
     msg.append("*Analiza HOT:*")
@@ -566,11 +605,18 @@ def daily_report() -> None:
     if p2info.get('rsi'): msg.append(f"• RSI: `{p2info['rsi']:.1f}`")
     vol_ratio = (p2info['vol7'] / p2info['vol30']) if p2info.get('vol30', 0) > 0 else 0
     msg.append(f"• Wolumen 7d/30d: `{vol_ratio:.2f}x` ({volume_label(vol_ratio)})")
+    if trends_line: msg.append("• " + trends_line)
+
+    msg.append("")
+    msg.append("*Dodatkowe wskaźniki:*")
+    if gas_line: msg.append("• " + gas_line)
+    if meme_line: msg.append("• " + meme_line)
+    if dxy is not None: msg.append(f"• DXY: `{dxy:.2f}` " + ("(rosnący)" if (dxy_slope and dxy_slope>0) else "(malejący/flat)"))
+    if vix is not None: msg.append(f"• VIX: `{vix:.1f}`")
     
     tg_send("\n".join(msg), parse_mode="Markdown")
 
     # --- 4. ZAPIS DO CSV I ALERTY (bez zmian) ---
-    # Ta sekcja jest kompletna, wklejona z Twojego oryginalnego kodu
     row = {
         "date": today,
         "hot_eth": round(p2info["hot_eth"],8),
